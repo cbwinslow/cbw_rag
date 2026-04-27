@@ -69,6 +69,7 @@ def _run_llm_stream(context: str, query: str):
 # ----------------------------------------------------------------------
 # Endpoints
 # ----------------------------------------------------------------------
+@record_metrics("query")
 @app.post("/query")
 async def query_rag(req: QueryRequest):
     try:
@@ -80,6 +81,7 @@ async def query_rag(req: QueryRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@record_metrics("answer")
 @app.post("/answer")
 async def answer_rag(req: AnswerRequest):
     try:
@@ -92,6 +94,7 @@ async def answer_rag(req: AnswerRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@record_metrics("answer_stream")
 @app.post("/answer/stream")
 async def answer_rag_stream(req: AnswerRequest):
     try:
@@ -105,15 +108,24 @@ async def answer_rag_stream(req: AnswerRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ----------------------------------------------------------------------
-# Metrics endpoint (Prometheus simple text format)
+# Metrics endpoint (Prometheus)
 # ----------------------------------------------------------------------
+from .metrics import REQ_COUNTER, REQ_LATENCY, metrics_response
+
 @app.get("/metrics")
 async def metrics():
-    # Placeholder – in a real deployment you would use prometheus_client library
-    metric_body = "# HELP cbw_rag_requests_total Total number of RAG requests\n" \
-                  "# TYPE cbw_rag_requests_total counter\n" \
-                  "cbw_rag_requests_total 0\n"
-    return StreamingResponse(iter([metric_body]), media_type="text/plain")
+    return StreamingResponse(iter([metrics_response()]), media_type="text/plain")
+
+# Helper decorators to record metrics
+def record_metrics(endpoint_name: str):
+    def decorator(func):
+        async def wrapper(*args, **kwargs):
+            REQ_COUNTER.labels(endpoint=endpoint_name).inc()
+            with REQ_LATENCY.labels(endpoint=endpoint_name).time():
+                return await func(*args, **kwargs)
+        return wrapper
+    return decorator
+
 
 # ----------------------------------------------------------------------
 # Health check
