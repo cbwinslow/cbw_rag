@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""
+CBW RAG Indexer - Scans files, extracts text, chunks, embeds via Ollama, stores in pgvector.
+"""
+
+import os, sys, json, hashlib, argparse, mimetypes, subprocess, time
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import List, Dict, Optional, Tuple, Generator
+from dataclasses import dataclass
+
+import psycopg2
+import ollama
+import tiktoken
+import chardet
+import magic
+
+DB_DSN = os.environ.get("CBW_RAG_DATABASE", "postgresql://cbwinslow:123qweasd@localhost:5432/cbw_rag")
+OLLAMA_URL = os.environ.get("CBW_RAG_OLLAMA_URL", "http://localhost:11434")
+EMBEDDING_MODEL = os.environ.get("CBW_RAG_EMBEDDING_MODEL", "nomic-embed-text")
+
+CHUNK_SIZE = 512
+CHUNK_OVERLAP = 64
+MAX_FILE_SIZE = 50 * 1024 * 1024
+
+TEXT_EXTS = {
+    '.txt','.md','.markdown','.rst','.log','.cfg','.conf','.ini',
+    '.yaml','.yml','.toml','.json','.xml','.csv','.tsv',
+    '.html','.htm','.css','.js','.ts','.jsx','.tsx',
+    '.py','.pyi','.rb','.rs','.go','.java','.kt','.kts',
+    '.c','.h','.cpp','.hpp','.cc','.cxx','.cs',
+    '.sh','.bash','.zsh','.fish','.ps1','.bat','.cmd',
+    '.sql','.r','.jl','.lua','.pl','.pm','.php','.swift',
+    '.dockerfile','.env','.gitignore','.editorconfig',
+    '.tf','.hcl','.proto','.graphql','.gql',
+    '.makefile','.cmake','.gradle','.bib','.tex',
+}
+
+SKIP_DIRS = {
+    '.git','.svn','.hg','node_modules','__pycache__','.pytest_cache',
+    '.mypy_cache','venv','.venv','env','.env','.tox','.eggs','.cache',
+    '.cargo','.rustup','.local','.npm','.nvm','.bun','vendor','target',
+    'build','dist','.next','.opencode','.kilo','.windsurf-server',
+    'site-packages','.bun','.rustup','.cache','__pycache__',
+}
+
+BINARY_EXTS = {
+    '.png','.jpg','.jpeg','.gif','.bmp','.ico','.svg','.webp',
+    '.mp3','.mp4','.avi','.mkv','.mov','.wav','.flac','.ogg',
+    '.zip','.tar','.gz','.bz2','.xz','.7z','.rar','.tgz',
+    '.exe','.dll','.so','.dylib','.o','.a','.lib',
+    '.pyc','.pyo','.class','.beam','.db','.sqlite','.sqlite3',
+    '.woff','.woff2','.ttf','.otf','.eot',
+}
+
+enc = tiktoken.get_encoding("cl100k_base")
+
+def count_tokens(text):
+    return len(enc.encode(text))
+
+def classify_file(path):
+    ext = path.suffix.lower()
+    name = path.name.lower()
+    lang_map = {
+        '.py':'python','.pyi':'python','.js':'javascript','.jsx':'javascript',
+        '.ts':'typescript','.tsx':'typescript','.rb':'ruby','.rs':'rust',
+        '.go':'go','.java':'java','.kt':'kotlin','.c':'c','.h':'c',
+        '.cpp':'cpp','.hpp':'cpp','.cs':'csharp','.sh':'shell','.bash':'bash',
+        '.zsh':'zsh','.sql':'sql','.r':'r','.jl':'julia','.lua':'lua',
+        '.php':'php','.swift':'swift','.html':'html','.htm':'html','.css':'css',
+        '.md':'markdown','.yaml':'yaml','.yml':'yaml','.json':'json',
+        '.xml':'xml','.toml':'toml','.tf':'terraform','.hcl':'hcl',
+    }
+    cat_map = {
+        '.py':'code','.js':'code','.ts':'code','.jsx':'code','.tsx':'code',
+        '.rb':'code','.rs':'code','.go':'code','.java':'code','.kt':'code',
+        '.c':'code','.h':'code','.cpp':'code','.hpp':'code','.cs':'code',
+        '.sh':'code','.bash':'code','.zsh':'code',
+        '.yaml':'config','.yml':'config','.toml':'config','.json':'config',
+        '.xml':'config','.conf':'config','.cfg':'config','.ini':'config','.env':'config',
+    }
+    lang = lang_map.get(ext)
+    if name in ('makefile','dockerfile'):
+        lang = name
+    cat = cat_map.get(ext, 'document')
+    return cat, lang
+
+def get_git_info(path):
+    try:
+        r = subprocess.run(['git','-C',str(path.parent),'rev-parse','--show-toplevel'], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0: return None, None, None, None
+        repo = r.stdout.strip()
+        branch = subprocess.run(['git','-C',str(path.parent),'branch','--show-current'], capture_output=True, text=True, timeout=5).stdout.strip() or None
+        commit = subprocess.run(['git','-C',str(path.parent),'log','-1','--format=%H','--',str(path)], capture_output=True, text=True, timeout=5).stdout.strip() or None
+        st = subprocess.run(['git','-C',str(path.parent),'status','--porcelain',str(path)], capture_output=True, text=True, timeout=5)
+        gs = 'modified' if st.stdout.strip() else ('tracked' if commit else 'untracked')
+        return repo, branch, commit, gs
+    except:
+        return None, None, None, None
+
+def extract_metadata(path):
+    try:
+        stat = path.stat(follow_symlinks=False)
+    except (OSError, PermissionError):
+        return None
+
+    ext = path.suffix.lower()
+    if ext in BINARY_EXTS:
+        return None
+
+    mime_type, _ = mimetypes.guess_type(str(path))
+    if not mime_type:
+        try: mime_type = magic.from_file(str(path), mime=True)
+        except: mime_type = None
+
+    encoding = None
+    try:
+        with open(path, 'rb') as f: raw = f.read(4096)
+        detected = chardet.detect(raw)
+        encoding = detected.get('encoding')
+    except: pass
+
+    try:
+        import pwd, grp
+        owner = pwd.getpwuid(stat.st_uid).pw_name
+        group = grp.getgrgid(stat.st_gid).gr_name
+    except:
+        owner, group = str(stat.st_uid), str(stat.st_gid)
+
+    cat, lang = classify_file(path)
+
+    line_count = None
+    if cat in ('code','document','config'):
+        try:
+            with open(path, 'rb') as f:
+                line_count = sum(1 for _ in f)
+        except: pass
+
+    try:
+        with open(path, 'rb') as f:
+            content_hash = hashlib.sha256(f.read()).hexdigest()
+    except:
+        return None
+
+    git_repo, git_branch, git_commit, git_status = get_git_info(path)
+
+    return {
+        'source_path': str(path.resolve()),
+        'file_name': path.name,
+        'file_extension': ext,
+        'file_size': stat.st_size,
+        'file_mode': stat.st_mode,
+        'file_owner': owner,
+        'file_group': group,
+        'mime_type': mime_type,
+        'file_category': cat,
+        'detected_language': lang,
+        'encoding': encoding,
+        'line_count': line_count,
+        'file_content_hash': content_hash,
+        'file_created_at': datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc),
+        'file_modified_at': datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
+        'git_repo_root': git_repo,
+        'git_branch': git_branch,
+        'git_last_commit': git_commit,
+        'git_status': git_status,
+    }
+
+def scan_directory(root, skip_dirs=SKIP_DIRS):
+    root_path = Path(root).resolve()
+    for dirpath, dirnames, filenames in os.walk(root_path, followlinks=False):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith('.cache')]
+        for fname in filenames:
+            p = Path(dirpath) / fname
+            if p.is_symlink() or not p.is_file():
+                continue
+            if p.suffix.lower() in BINARY_EXTS:
+                continue
+            yield p
+
+def extract_text(path, category):
+    ext = path.suffix.lower()
+    if ext == '.pdf':
+        try:
+            r = subprocess.run(['pdftotext', str(path), '-'], capture_output=True, text=True, timeout=60)
+            if r.returncode == 0: return r.stdout
+        except: pass
+        return None
+    if ext == '.docx':
+        try:
+            from docx import Document
+            return '\n'.join(p.text for p in Document(str(path)).paragraphs if p.text.strip())
+        except: pass
+        return None
+    if ext in ('.xlsx', '.xls'):
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(str(path), read_only=True, data_only=True)
+            lines = []
+            for sheet in wb.worksheets:
+                for row in sheet.iter_rows(values_only=True):
+                    line = '\t'.join(str(c) if c is not None else '' for c in row)
+                    if line.strip(): lines.append(line)
+            wb.close()
+            return '\n'.join(lines)
+        except: pass
+        return None
+    if category in ('code','document','config','unknown'):
+        try:
+            with open(path, 'rb') as f: raw = f.read(MAX_FILE_SIZE)
+            detected = chardet.detect(raw)
+            enc_name = detected.get('encoding', 'utf-8') or 'utf-8'
+            return raw.decode(enc_name, errors='replace')
+        except: pass
+    return None
+
+def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    if not text or not text.strip(): return []
+    lines = text.split('\n')
+    chunks = []
+    current = []
+    current_tokens = 0
+    start_line = 1
+
+    for i, line in enumerate(lines, 1):
+        lt = count_tokens(line)
+        if current_tokens + lt > chunk_size and current:
+            content = '\n'.join(current)
+            if content.strip():
+                chunks.append({
+                    'content': content,
+                    'content_hash': hashlib.sha256(content.encode()).hexdigest(),
+                    'token_count': current_tokens,
+                    'char_count': len(content),
+                    'start_line': start_line,
+                    'end_line': i - 1,
+                })
+            overlap_lines = []
+            overlap_t = 0
+            for prev in reversed(current):
+                pl = count_tokens(prev)
+                if overlap_t + pl > overlap: break
+                overlap_lines.insert(0, prev)
+                overlap_t += pl
+            current = overlap_lines + [line]
+            current_tokens = overlap_t + lt
+            start_line = i - len(overlap_lines)
+        else:
+            current.append(line)
+            current_tokens += lt
+
+    if current:
+        content = '\n'.join(current)
+        if content.strip():
+            chunks.append({
+                'content': content,
+                'content_hash': hashlib.sha256(content.encode()).hexdigest(),
+                'token_count': current_tokens,
+                'char_count': len(content),
+                'start_line': start_line,
+                'end_line': len(lines),
+            })
+    return chunks
+
+def generate_embeddings(texts, model=EMBEDDING_MODEL):
+    """Generate embeddings in batches using ollama.embed()."""
+    embeddings = []
+    batch_size = 8
+    for i in range(0, len(texts), batch_size):
+        batch = [t[:2000] for t in texts[i:i+batch_size]]
+        try:
+            r = ollama.embed(model=model, input=batch)
+            embeddings.extend(r['embeddings'])
+        except Exception as e:
+            print(f"  Embedding batch error: {e}", file=sys.stderr)
+            for text in batch:
+                try:
+                    r2 = ollama.embeddings(model=model, prompt=text[:2000])
+                    embeddings.append(r2['embedding'])
+                except:
+                    embeddings.append([0.0] * 768)
+    return embeddings
+
+def store_file(cur, meta):
+    """Upsert file, return (file_id, needs_indexing)."""
+    cur.execute("SELECT id, file_content_hash FROM files WHERE source_path = %s", (meta['source_path'],))
+    row = cur.fetchone()
+    if row:
+        fid, old_hash = row
+        if old_hash == meta['file_content_hash']:
+            return fid, False
+        cur.execute("DELETE FROM document_chunks WHERE file_id = %s", (fid,))
+        cur.execute("""UPDATE files SET file_name=%s, file_extension=%s, file_size=%s, file_mode=%s,
+            file_owner=%s, file_group=%s, mime_type=%s, file_category=%s, detected_language=%s,
+            encoding=%s, line_count=%s, file_content_hash=%s, file_modified_at=%s,
+            git_repo_root=%s, git_branch=%s, git_last_commit=%s, git_status=%s,
+            index_status='pending', indexed_at=NOW() WHERE id=%s""",
+            (meta['file_name'], meta['file_extension'], meta['file_size'], meta['file_mode'],
+             meta['file_owner'], meta['file_group'], meta['mime_type'], meta['file_category'],
+             meta['detected_language'], meta['encoding'], meta['line_count'], meta['file_content_hash'],
+             meta['file_modified_at'], meta['git_repo_root'], meta['git_branch'],
+             meta['git_last_commit'], meta['git_status'], fid))
+        return fid, True
+    else:
+        cur.execute("""INSERT INTO files (source_path,file_name,file_extension,file_size,file_mode,
+            file_owner,file_group,mime_type,file_category,detected_language,encoding,line_count,
+            file_content_hash,file_created_at,file_modified_at,git_repo_root,git_branch,
+            git_last_commit,git_status,index_status)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending')
+            RETURNING id""",
+            (meta['source_path'], meta['file_name'], meta['file_extension'], meta['file_size'],
+             meta['file_mode'], meta['file_owner'], meta['file_group'], meta['mime_type'],
+             meta['file_category'], meta['detected_language'], meta['encoding'], meta['line_count'],
+             meta['file_content_hash'], meta['file_created_at'], meta['file_modified_at'],
+             meta['git_repo_root'], meta['git_branch'], meta['git_last_commit'], meta['git_status']))
+        return cur.fetchone()[0], True
+
+def store_chunks(cur, file_id, chunks, embeddings, model):
+    for i, chunk in enumerate(chunks):
+        cur.execute("""INSERT INTO document_chunks (file_id,chunk_index,total_chunks,content,content_hash,
+            token_count,char_count,start_line,end_line)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            (file_id, i, len(chunks), chunk['content'], chunk['content_hash'],
+             chunk['token_count'], chunk['char_count'], chunk['start_line'], chunk['end_line']))
+        cid = cur.fetchone()[0]
+        emb = embeddings[i] if i < len(embeddings) else [0.0] * 768
+        emb_str = '[' + ','.join(str(x) for x in emb) + ']'
+        if len(emb) <= 2000:
+            cur.execute("""INSERT INTO embeddings (chunk_id,file_id,model_name,embedding)
+                VALUES (%s,%s,%s,%s::vector) ON CONFLICT (chunk_id,model_name)
+                DO UPDATE SET embedding=EXCLUDED.embedding, created_at=NOW()""",
+                (cid, file_id, model, emb_str))
+        else:
+            cur.execute("""INSERT INTO embeddings_large (chunk_id,file_id,model_name,embedding)
+                VALUES (%s,%s,%s,%s::vector) ON CONFLICT (chunk_id,model_name)
+                DO UPDATE SET embedding=EXCLUDED.embedding, created_at=NOW()""",
+                (cid, file_id, model, emb_str))
+    cur.execute("UPDATE files SET chunk_count=%s, index_status='indexed', indexed_at=NOW() WHERE id=%s",
+                (len(chunks), file_id))
+
+def index_files(paths, dry_run=False, resume=False, batch_size=50, verbose=False, model=EMBEDDING_MODEL):
+    conn = psycopg2.connect(DB_DSN)
+    conn.autocommit = False
+    cur = conn.cursor()
+
+    stats = {'scanned':0,'indexed':0,'unchanged':0,'skipped':0,'errors':0,'chunks':0,'embeddings':0}
+    batch = []
+
+    try:
+        for root in paths:
+            print(f"\nScanning: {root}")
+            for path in scan_directory(root):
+                stats['scanned'] += 1
+                if stats['scanned'] % 100 == 0:
+                    print(f"  {stats['scanned']} scanned | {stats['indexed']} indexed | {stats['unchanged']} unchanged | {stats['skipped']} skipped")
+
+                meta = extract_metadata(path)
+                if meta is None:
+                    stats['skipped'] += 1
+                    continue
+
+                if meta['file_size'] > MAX_FILE_SIZE:
+                    stats['skipped'] += 1
+                    continue
+
+                if dry_run:
+                    print(f"  WOULD INDEX: {meta['source_path']} [{meta['file_category']}/{meta['detected_language']}]")
+                    continue
+
+                fid, needs_idx = store_file(cur, meta)
+                if not needs_idx:
+                    stats['unchanged'] += 1
+                    conn.rollback()
+                    continue
+
+                text = extract_text(path, meta['file_category'])
+                if not text or not text.strip():
+                    cur.execute("UPDATE files SET index_status='skipped' WHERE id=%s", (fid,))
+                    stats['skipped'] += 1
+                    conn.commit()
+                    continue
+
+                chunks = chunk_text(text)
+                if not chunks:
+                    cur.execute("UPDATE files SET index_status='skipped' WHERE id=%s", (fid,))
+                    stats['skipped'] += 1
+                    conn.commit()
+                    continue
+
+                batch.append((fid, chunks, meta['source_path']))
+
+                if len(batch) >= batch_size:
+                    _process_batch(cur, batch, model, stats, verbose)
+                    batch = []
+                    conn.commit()
+
+            if batch:
+                _process_batch(cur, batch, model, stats, verbose)
+                batch = []
+                conn.commit()
+
+    finally:
+        cur.close()
+        conn.close()
+
+    print(f"\n--- Done ---")
+    print(f"Scanned: {stats['scanned']} | Indexed: {stats['indexed']} | Unchanged: {stats['unchanged']} | Skipped: {stats['skipped']} | Errors: {stats['errors']}")
+    print(f"Chunks: {stats['chunks']} | Embeddings: {stats['embeddings']}")
+    return stats
+
+def _process_batch(cur, batch, model, stats, verbose):
+    all_texts = []
+    mapping = []
+    for fid, chunks, path in batch:
+        for i, ch in enumerate(chunks):
+            mapping.append((fid, i, len(all_texts)))
+            all_texts.append(ch['content'])
+
+    if not all_texts: return
+    if verbose: print(f"  Embedding {len(all_texts)} chunks...")
+    embeddings = generate_embeddings(all_texts, model)
+
+    emb_by_file = {}
+    for fid, ci, ti in mapping:
+        emb_by_file.setdefault(fid, []).append(embeddings[ti])
+
+    for fid, chunks, path in batch:
+        try:
+            store_chunks(cur, fid, chunks, emb_by_file.get(fid, []), model)
+            stats['indexed'] += 1
+            stats['chunks'] += len(chunks)
+            stats['embeddings'] += len(chunks)
+            if verbose: print(f"  OK: {path} ({len(chunks)} chunks)")
+        except Exception as e:
+            stats['errors'] += 1
+            if verbose: print(f"  ERR: {path}: {e}")
+            cur.execute("UPDATE files SET index_status='error' WHERE id=%s", (fid,))
+
+def main():
+    parser = argparse.ArgumentParser(description='CBW RAG Indexer')
+    parser.add_argument('paths', nargs='+', help='Directories to index')
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--batch-size', type=int, default=50)
+    parser.add_argument('--verbose', '-v', action='store_true')
+    parser.add_argument('--model', default=EMBEDDING_MODEL)
+    args = parser.parse_args()
+
+    index_files(args.paths, dry_run=args.dry_run, resume=args.resume,
+                batch_size=args.batch_size, verbose=args.verbose, model=args.model)
+
+if __name__ == '__main__':
+    main()
